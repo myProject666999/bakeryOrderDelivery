@@ -99,7 +99,7 @@ public class DeliveryService {
         
         if (status == 2) {
             task.setActualArrivalTime(LocalDateTime.now());
-            Order order = orderRepository.findById(task.getOrderId()).orElseThrow();
+            Order order = orderRepository.findById(task.getOrderId()).orElseThrow(() -> new BusinessException("订单不存在"));
             order.setOrderStatus(4);
             orderRepository.save(order);
             
@@ -108,7 +108,7 @@ public class DeliveryService {
             riderTasks.addAll(deliveryTaskRepository
                 .findByRiderIdAndTaskStatus(task.getRiderId(), 1));
             if (riderTasks.isEmpty()) {
-                Rider rider = riderRepository.findById(task.getRiderId()).orElseThrow();
+                Rider rider = riderRepository.findById(task.getRiderId()).orElseThrow(() -> new BusinessException("骑手不存在"));
                 rider.setStatus(1);
                 riderRepository.save(rider);
             }

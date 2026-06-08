@@ -71,7 +71,7 @@ public class OrderService {
         List<Long> deductedProducts = new ArrayList<>();
         try {
             for (OrderItemRequest itemRequest : request.getItems()) {
-                Product product = productRepository.findById(itemRequest.getProductId()).orElseThrow();
+                Product product = productRepository.findById(itemRequest.getProductId()).orElseThrow(() -> new BusinessException("商品不存在"));
                 
                 boolean success = inventoryService.deductInventory(itemRequest.getProductId(), itemRequest.getQuantity());
                 if (!success) {
@@ -127,7 +127,7 @@ public class OrderService {
     private BigDecimal calculateTotal(List<OrderItemRequest> items) {
         return items.stream()
             .map(item -> {
-                Product product = productRepository.findById(item.getProductId()).orElseThrow();
+                Product product = productRepository.findById(item.getProductId()).orElseThrow(() -> new BusinessException("商品不存在"));
                 return product.getPrice().multiply(BigDecimal.valueOf(item.getQuantity()));
             })
             .reduce(BigDecimal.ZERO, BigDecimal::add);

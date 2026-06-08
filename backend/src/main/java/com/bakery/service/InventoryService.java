@@ -41,7 +41,11 @@ public class InventoryService {
     private final DefaultRedisScript<Long> deductScript = new DefaultRedisScript<>(
         "local key = KEYS[1] " +
         "local quantity = tonumber(ARGV[1]) " +
-        "local current = tonumber(redis.call('get', key) or '0') " +
+        "local stock_value = redis.call('get', key) " +
+        "local current = 0 " +
+        "if stock_value ~= false then " +
+        "    current = tonumber(stock_value) " +
+        "end " +
         "if current >= quantity then " +
         "    redis.call('decrby', key, quantity) " +
         "    return current - quantity " +
@@ -62,9 +66,22 @@ public class InventoryService {
         LocalDate today = LocalDate.now();
         String key = getInventoryKey(productId, today);
         
-        Boolean exists = redisTemplate.hasKey(key);
-        if (Boolean.FALSE.equals(exists)) {
-            redisTemplate.opsForValue().set(key, product.getDailyCapacity(), 24, TimeUnit.HOURS);
+        boolean needInit = true;
+        try {
+            Boolean exists = redisTemplate.hasKey(key);
+            if (Boolean.TRUE.equals(exists)) {
+                needInit = false;
+            }
+        } catch (Exception e) {
+            log.warn("检查Redis库存key异常，直接从数据库初始化", e);
+        }
+        
+        if (needInit) {
+            try {
+                redisTemplate.opsForValue().set(key, product.getDailyCapacity(), 24, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("设置Redis库存失败", e);
+            }
             
             DailyInventory inventory = dailyInventoryRepository
                 .findByProductIdAndInventoryDate(productId, today)
@@ -81,12 +98,25 @@ public class InventoryService {
         LocalDate today = LocalDate.now();
         String key = getInventoryKey(productId, today);
         
-        Object value = redisTemplate.opsForValue().get(key);
-        if (value == null) {
-            initializeDailyInventory(productId);
-            value = redisTemplate.opsForValue().get(key);
+        try {
+            Object value = redisTemplate.opsForValue().get(key);
+            if (value != null) {
+                return Integer.parseInt(value.toString());
+            }
+        } catch (Exception e) {
+            log.warn("从Redis获取库存失败，尝试从数据库获取", e);
         }
-        return value != null ? Integer.parseInt(value.toString()) : 0;
+        
+        DailyInventory inventory = dailyInventoryRepository
+            .findByProductIdAndInventoryDate(productId, today)
+            .orElse(null);
+        if (inventory != null) {
+            return inventory.getRemainingQuantity();
+        }
+        
+        initializeDailyInventory(productId);
+        Product product = productRepository.findById(productId).orElse(null);
+        return product != null ? product.getDailyCapacity() : 0;
     }
 
     public boolean deductInventory(Long productId, int quantity) {
@@ -97,7 +127,28 @@ public class InventoryService {
         LocalDate today = LocalDate.now();
         String key = getInventoryKey(productId, today);
         
-        Long remaining = redisTemplate.execute(deductScript, Collections.singletonList(key), String.valueOf(quantity));
+        try {
+            Boolean hasKey = redisTemplate.hasKey(key);
+            if (!Boolean.TRUE.equals(hasKey)) {
+                initializeDailyInventory(productId);
+            }
+        } catch (Exception e) {
+            log.warn("检查Redis库存key失败，尝试从数据库检查", e);
+            DailyInventory inventory = dailyInventoryRepository
+                .findByProductIdAndInventoryDate(productId, today)
+                .orElse(null);
+            if (inventory == null) {
+                initializeDailyInventory(productId);
+            }
+        }
+        
+        Long remaining;
+        try {
+            remaining = redisTemplate.execute(deductScript, Collections.singletonList(key), String.valueOf(quantity));
+        } catch (Exception e) {
+            log.error("Redis扣减库存失败，尝试数据库扣减", e);
+            return deductInventoryFromDB(productId, quantity, today);
+        }
         
         if (remaining == null || remaining < 0) {
             return false;
@@ -113,12 +164,48 @@ public class InventoryService {
         
         return true;
     }
+    
+    private boolean deductInventoryFromDB(Long productId, int quantity, LocalDate today) {
+        DailyInventory inventory = dailyInventoryRepository
+            .findByProductIdAndInventoryDate(productId, today)
+            .orElseThrow(() -> new BusinessException("库存不存在"));
+        
+        if (inventory.getRemainingQuantity() < quantity) {
+            return false;
+        }
+        
+        inventory.setRemainingQuantity(inventory.getRemainingQuantity() - quantity);
+        dailyInventoryRepository.save(inventory);
+        
+        try {
+            redisTemplate.opsForValue().set(getInventoryKey(productId, today), 
+                inventory.getRemainingQuantity(), 24, TimeUnit.HOURS);
+        } catch (Exception e) {
+            log.warn("同步数据库库存到Redis失败", e);
+        }
+        
+        return true;
+    }
 
     public void restoreInventory(Long productId, int quantity) {
         LocalDate today = LocalDate.now();
         String key = getInventoryKey(productId, today);
         
-        redisTemplate.opsForValue().increment(key, quantity);
+        try {
+            Boolean hasKey = redisTemplate.hasKey(key);
+            if (Boolean.TRUE.equals(hasKey)) {
+                redisTemplate.opsForValue().increment(key, quantity);
+            } else {
+                initializeDailyInventory(productId);
+                Product product = productRepository.findById(productId).orElse(null);
+                if (product != null) {
+                    redisTemplate.opsForValue().set(key, product.getDailyCapacity() + quantity, 
+                        24, TimeUnit.HOURS);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Redis恢复库存失败", e);
+        }
         
         DailyInventory inventory = dailyInventoryRepository
             .findByProductIdAndInventoryDate(productId, today)
